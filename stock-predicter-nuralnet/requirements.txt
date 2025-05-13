@@ -1,0 +1,11 @@
+datasets
+pytesseract
+pandas
+numpy
+scipy
+yfinance
+beautifulsoup4
+openpyxl
+scikit-learn
+matplotlib
+torch

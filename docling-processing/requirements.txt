@@ -1,0 +1,3 @@
+yamal
+docling-core
+docling

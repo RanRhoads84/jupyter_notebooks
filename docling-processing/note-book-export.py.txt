@@ -1,0 +1,353 @@
+# %% [markdown]
+# # Docling Batch Processing Notebook
+#
+# ## Overview
+#
+# This Jupyter notebook provides efficient batch processing of PDF documents using Docling, with hardware-aware optimizations for GPU and CPU utilization.
+#
+# ## Requirements
+#
+# - Python 3.x
+# - NVIDIA GPU with CUDA support
+# - Required Python packages:
+#   ```
+#   docling
+#   psutil
+#   pyyaml
+#   ```
+# - Minimum 8GB RAM recommended
+# - NVIDIA drivers with `nvidia-smi` utility
+#
+# ## Hardware Optimization
+#
+# The notebook automatically detects and configures:
+#
+# - Available GPU memory for optimal batch sizes
+# - CPU core count for potential parallel processing
+# - System RAM availability
+#
+# ## Input/Output Structure
+#
+
+# %% [markdown]
+# project/
+# ├── input-data/
+# │ └── pdf/ # Place input PDFs here
+# └── output-data/
+# ├── document1/ # One folder per input
+# │ ├── document1.json
+# │ ├── document1.html
+# │ ├── document1.md
+# │ └── ...
+# └── document2/
+# └── ...
+#
+
+# %% [markdown]
+# ## Features
+#
+# - Automatic hardware detection and optimization
+# - Batch processing for GPU efficiency
+# - Multiple output formats:
+#   - JSON (with image placeholders)
+#   - HTML (with embedded images)
+#   - Markdown
+#   - YAML
+#   - Plain text
+#   - Doctags
+#
+# ## Usage
+#
+# 1. Place PDF files in the `input-data/pdf/` directory
+# 2. Run all cells in the notebook
+# 3. Processed files will appear in `output-data/` with one subfolder per input document
+#
+# ## Performance Notes
+#
+# - GPU memory usage: ~2000MB per document
+# - Batch size is automatically calculated based on available GPU memory
+# - Processing multiple documents simultaneously for optimal GPU utilization
+#
+# ## Error Handling
+#
+# - Failed conversions are logged but don't stop the batch
+# - Partial successes are noted with specific error messages
+# - Final summary shows success/partial/failure counts
+#
+# ## Logging
+#
+# The notebook provides detailed logging of:
+#
+# - Hardware detection results
+# - Conversion progress and errors
+# - Final processing statistics
+# - Total processing time
+#
+
+# %%
+# Cell to Import necessary libraries
+import json
+import logging
+import time
+import yaml
+import psutil
+import os
+import subprocess
+from collections.abc import Iterable
+from pathlib import Path
+from docling_core.types.doc import ImageRefMode
+from docling.backend.docling_parse_v4_backend import DoclingParseV4DocumentBackend
+from docling.datamodel.base_models import ConversionStatus, InputFormat
+from docling.datamodel.document import ConversionResult
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
+
+# %%
+# Hardware checks to determine most efficient settings
+
+
+def get_gpu_memory():
+    """Returns total and free GPU memory in MB (NVIDIA only)."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+                "--format=csv,nounits,noheader"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True
+        )
+        total, free = map(int, result.stdout.strip().split('\n')[0].split(','))
+        return total, free
+    except Exception as e:
+        print("Could not query GPU memory:", e)
+        return None, None
+
+
+# CPU checks
+num_cores = os.cpu_count()
+mem = psutil.virtual_memory()
+
+if num_cores is None or num_cores < 2:
+    print("Warning: Only one CPU core detected. Parallel processing may not help.")
+if mem.total < 8 * 1024 ** 3:  # Less than 8GB RAM
+    print("Warning: Low system memory detected.")
+
+print(
+    f"Detected CPU cores: {num_cores} | Total RAM: {mem.total / (1024 ** 3):.2f} GB"
+)
+
+if num_cores is not None and num_cores > 8:
+    max_workers = num_cores - 4
+elif num_cores is not None and num_cores > 1:
+    max_workers = num_cores
+else:
+    max_workers = 1
+
+print(f"Using {max_workers} worker processes.")
+
+# GPU checks and batch size suggestion
+MEMORY_PER_DOC_MB = 2000  # Adjust for your workload
+total_mem, free_mem = get_gpu_memory()
+if free_mem:
+    max_batch_size = max(1, free_mem // MEMORY_PER_DOC_MB)
+    print(
+        f"Detected GPU with {free_mem} MB free. Suggested batch size: {max_batch_size}")
+else:
+    max_batch_size = 1
+    print("No GPU detected or unable to query. Using batch size: 1")
+
+# %%
+_log = logging.getLogger(__name__)
+
+USE_V2 = True
+USE_LEGACY = False
+
+# %%
+
+
+def export_documents(
+    conv_results: Iterable[ConversionResult],
+    output_dir: Path,
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    success_count = 0
+    failure_count = 0
+    partial_success_count = 0
+
+    for conv_res in conv_results:
+        if conv_res.status == ConversionStatus.SUCCESS:
+            success_count += 1
+            doc_filename = conv_res.input.file.stem
+
+            if USE_V2:
+                conv_res.document.save_as_json(
+                    output_dir / f"{doc_filename}.json",
+                    image_mode=ImageRefMode.PLACEHOLDER,
+                )
+                conv_res.document.save_as_html(
+                    output_dir / f"{doc_filename}.html",
+                    image_mode=ImageRefMode.EMBEDDED,
+                )
+                conv_res.document.save_as_doctags(
+                    output_dir / f"{doc_filename}.doctags.txt"
+                )
+                conv_res.document.save_as_markdown(
+                    output_dir / f"{doc_filename}.md",
+                    image_mode=ImageRefMode.PLACEHOLDER,
+                )
+                conv_res.document.save_as_markdown(
+                    output_dir / f"{doc_filename}.txt",
+                    image_mode=ImageRefMode.PLACEHOLDER,
+                )
+
+                # Export Docling document format to YAML:
+                with (output_dir / f"{doc_filename}.yaml").open("w") as fp:
+                    fp.write(yaml.safe_dump(
+                        conv_res.document.export_to_dict()))
+
+                # Export Docling document format to doctags:
+                with (output_dir / f"{doc_filename}.doctags.txt").open("w") as fp:
+                    fp.write(conv_res.document.export_to_doctags())
+
+                # Export Docling document format to markdown:
+                with (output_dir / f"{doc_filename}.md").open("w") as fp:
+                    fp.write(conv_res.document.export_to_markdown())
+
+                # Export Docling document format to text:
+                with (output_dir / f"{doc_filename}.txt").open("w") as fp:
+                    fp.write(conv_res.document.export_to_markdown(
+                    ))
+
+            if USE_LEGACY:
+                # Export Deep Search document JSON format:
+                with (output_dir / f"{doc_filename}.legacy.json").open(
+                    "w", encoding="utf-8"
+                ) as fp:
+                    fp.write(json.dumps(
+                        conv_res.document.export_to_dict()))
+
+                # Export Text format:
+                with (output_dir / f"{doc_filename}.legacy.txt").open(
+                    "w", encoding="utf-8"
+                ) as fp:
+                    fp.write(
+                        conv_res.document.export_to_markdown(
+                        )
+                    )
+
+                # Export Markdown format:
+                with (output_dir / f"{doc_filename}.legacy.md").open(
+                    "w", encoding="utf-8"
+                ) as fp:
+                    fp.write(conv_res.document.export_to_markdown())
+
+                # Export Document Tags format:
+                with (output_dir / f"{doc_filename}.legacy.doctags.txt").open(
+                    "w", encoding="utf-8"
+                ) as fp:
+                    fp.write(conv_res.document.export_to_doctags())
+
+        elif conv_res.status == ConversionStatus.PARTIAL_SUCCESS:
+            _log.info(
+                f"Document {conv_res.input.file} was partially converted with the following errors:"
+            )
+            for item in conv_res.errors:
+                _log.info(f"\t{item.error_message}")
+            partial_success_count += 1
+        else:
+            _log.info(f"Document {conv_res.input.file} failed to convert.")
+            failure_count += 1
+
+    _log.info(
+        f"Processed {success_count + partial_success_count + failure_count} docs, "
+        f"of which {failure_count} failed "
+        f"and {partial_success_count} were partially converted."
+    )
+    return success_count, partial_success_count, failure_count
+
+# %%
+
+
+def batch(iterable, batch_size):
+    l = len(iterable)
+    for ndx in range(0, l, batch_size):
+        yield iterable[ndx:min(ndx + batch_size, l)]
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+
+    try:
+        base_dir = Path(__file__).parent
+    except NameError:
+        base_dir = Path().resolve()
+
+    # Set up the input directory (change as needed)
+    input_dir = base_dir / "input-data/pdf"
+    # Collect all PDF files in the input directory
+    input_doc_paths = list(input_dir.glob("*.pdf"))
+
+    if not input_doc_paths:
+        print(f"No PDF files found in {input_dir}")
+        return
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.generate_page_images = True
+
+    doc_converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options, backend=DoclingParseV4DocumentBackend
+            )
+        }
+    )
+
+    output_dir = base_dir / "output-data"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_success = 0
+    total_partial = 0
+    total_failure = 0
+
+    start_time = time.time()
+
+    for file_batch in batch(input_doc_paths, max_batch_size):
+        conv_results = doc_converter.convert_all(
+            file_batch,
+            raises_on_error=False,
+        )
+        for conv_res in conv_results:
+            # Make a subfolder for each input document
+            doc_filename = conv_res.input.file.stem
+            doc_output_dir = output_dir / doc_filename
+            doc_output_dir.mkdir(parents=True, exist_ok=True)
+            # Export this document's results to its subfolder
+            export_documents([conv_res], output_dir=doc_output_dir)
+            if conv_res.status == ConversionStatus.SUCCESS:
+                total_success += 1
+            elif conv_res.status == ConversionStatus.PARTIAL_SUCCESS:
+                total_partial += 1
+            else:
+                total_failure += 1
+
+        success_count, partial_success_count, failure_count = export_documents(
+            conv_results, output_dir=output_dir,
+        )
+        total_success += success_count
+        total_partial += partial_success_count
+        total_failure += failure_count
+
+    end_time = time.time() - start_time
+
+    _log.info(f"Document conversion complete in {end_time:.2f} seconds.")
+    print(
+        f"Total: {total_success} success, {total_partial} partial, {total_failure} failed.")
+
+    if total_failure > 0:
+        raise RuntimeError(
+            f"The example failed converting {total_failure} on {len(input_doc_paths)}."
+        )
+
+
+# %%
+if __name__ == "__main__":
+    main()
